@@ -1,61 +1,65 @@
 pipeline {
     agent any
+
+    environment {
+        // Docker Hub 계정 정보 및 이미지 설정
+        DOCKER_HUB_REPO = 'bilbadarryl081/spring-kubernetes-app'
+        IMAGE_TAG       = "${BUILD_NUMBER}"             // Jenkins 내장 빌드 번호
+        REGISTRY_CREDS  = 'docker-hub-auth'     // Jenkins Credentials ID
+    }
+
     stages {
         stage('Git Clone') {
             steps {
-		            echo '1. 소스 코드 가져오는 중...'
-                git branch: 'main', url: 'https://github.com/hwanyhee1209/spring-repo.git'
+                echo '1. 소스 코드 가져오는 중...'
+                git branch: 'main', url: 'https://github.com/hwanyhee1209/spring-kubernetes-app.git'
             }
         }
-        stage('Build') {
+
+        stage('Build Application') {
             steps {
-		        echo '2. 프로젝트 빌드 중...'
-		        // 실행 권한 부여 추가
+                echo '2. 프로젝트 빌드 중...'
                 sh 'chmod +x gradlew'
-                //-x test :unit test(단위 테스트) 실행 단계를 제외(exclude)
-                //빠른 빌드 및 배포를 위해 테스트를 스킵
-                //빌드 서버(EC2) 환경에서 테스트용 DB나 외부 API 연동 환경이 구축되어 있지 않아 발생할 수 있는 빌드 실패를 방지
-                //테스트는 실행하되 결과와 상관없이 빌드를 진행하고 싶은 경우
-                //sh './gradlew clean build --continue'
-                // -plain.jar 생성 방지 옵션(-x test와 함께 전달 가능) 및 빌드
+                // plain jar 생성 방지 및 단위 테스트 스킵 빌드
                 sh './gradlew clean build -x test -PplainJar.enabled=false'
             }
         }
-        stage('Docker Build & Run') {
+
+        stage('Build Docker Image') {
             steps {
-		           // 젠킨스가 8080 사용.스프링 부트와 충돌 피하기 위해
-		           // Docker 포트 포워딩(외부 포트) 변경
-	             // 외부 포트를 8081로 변경 (-p 8081:8080)
-	             // 도커 호스트 포트 : 컨테이너 내부 포트
-	             // 젠킨스 접속: http://EC2_IP:8080
-	             // 스프링 부트 접속: http://EC2_IP:8081
-                echo '3. 도커 이미지 빌드 및 EC2 배포 중...'
-                sh '''
-                    # 1) 기존 실행 중인 컨테이너 중지 및 삭제
-                    docker stop spring-app || true
-                    docker rm spring-app || true
+                echo '3. 도커 이미지 빌드 중...'
+                // 프로젝트 루트의 Dockerfile을 기반으로 이미지 빌드
+                sh """
+                    docker build -t ${DOCKER_HUB_REPO}:${IMAGE_TAG} .
+                    docker build -t ${DOCKER_HUB_REPO}:latest .
+                """
+            }
+        }
 
-                    # 2) 도커 이미지 빌드
-                    docker build -t spring-app .
-
-                    # 3) 도커 컨테이너 실행 (젠킨스 포트 8080과 충돌을 피하기 위해 호스트 8081 포트 매핑)
-                    # 젠킨스 접속: http://EC2_IP:8080 / 스프링부트 접속: http://EC2_IP:8081
-                    docker run -d -p 8081:8080 --name spring-app spring-app
-
-                    # 4) 미사용(Dangling) 도커 이미지 정리 (EC2 디스크 용량 관리)
-                    docker image prune -f || true
-
-                    echo '배포 완료!'
-                '''
+        stage('Push to Docker Hub') {
+            steps {
+                echo '4. 도커 허브 로그인 및 이미지 푸시 중...'
+                // withCredentials를 사용해 Docker Hub 로그인 및 푸시
+                // usernameVariable: 'DOCKER_USER' : 찾아온 자격 증명의 사용자명(Username)을 DOCKER_USER라는 변수 이름으로 주입
+                // passwordVariable: 'DOCKER_PASS' : 찾아온 자격 증명의 비밀번호/토큰(Password)을 DOCKER_PASS라는 변수 이름으로 주입
+                // 즉, 파이프라인 블록이 실행되는 동안만 해당 변수들에 실제 데이터가 담겨 전달된다
+                withCredentials([usernamePassword(credentialsId: env.REGISTRY_CREDS, usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    sh """
+                        echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin
+                        docker push ${DOCKER_HUB_REPO}:${IMAGE_TAG}
+                        docker push ${DOCKER_HUB_REPO}:latest
+                    """
+                }
             }
         }
     }
+
     post {
-        success {
-            echo 'CI/CD 파이프라인이 성공적으로 완료되었습니다.'
-        }
-        failure {
-            echo '파이프라인 실행 중 오류가 발생했습니다.'
+        always {
+            echo '5. Docker 로그인 정보 및 로컬 이미지 정리 작업 수행 중...'
+            sh 'docker logout'
+            sh "docker rmi ${DOCKER_HUB_REPO}:${IMAGE_TAG} || true"
+            sh "docker rmi ${DOCKER_HUB_REPO}:latest || true"
         }
     }
 }
